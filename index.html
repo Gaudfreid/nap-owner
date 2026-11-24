@@ -155,7 +155,7 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
     db.auth.signInWithPassword({ email: $('email').value.trim(), password: $('password').value })
       .then(function (r) {
         $('loginBtn').disabled = false;
-        if (r.error) { err.textContent = 'Sign-in failed. Check your email and password.'; err.classList.remove('hidden'); return; }
+        if (r.error) { err.textContent = 'Sign-in failed: ' + r.error.message; err.classList.remove('hidden'); return; }
         $('password').value = '';
         start();
       });
