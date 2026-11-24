@@ -611,8 +611,10 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
   setInterval(function () { if (!document.hidden && state.me) loadChats(); }, 20000);
 
   // ------------------------------------------------------------- calendar ----
-  // View only. Shows reservations, active holds and blocked dates. It never changes anything.
-  var cal = { y: null, m: null, res: [], holds: [], blocks: [], names: {}, err: null, loaded: false, sel: null };
+  // Shows reservations, active holds and blocked dates. Owners can add/release holds and block/unblock dates here.
+  // Reservations are read only. Nothing here confirms a booking or messages a guest.
+  var cal = { y: null, m: null, res: [], holds: [], blocks: [], names: {}, err: null, loaded: false, sel: null,
+    props: [], propId: null, form: null, draft: {}, msg: null, busy: false };
 
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
   function manilaToday() { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date()); }
@@ -642,12 +644,13 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
       if (x.status !== 'active') return;
       var rg = parseRange(x.period) || { start: x.check_in, end: x.check_out };
       out.push({ kind: 'Hold', cls: 'p-hold', label: x.label || 'Hold', start: rg.start, end: rg.end,
-        sub: 'active hold' + (x.reason ? ' · ' + x.reason : '') + (x.remind_on ? ' · remind ' + dateOnly(x.remind_on) : ''), stay: true });
+        sub: 'active hold' + (x.reason ? ' · ' + x.reason : '') + (x.remind_on ? ' · remind ' + dateOnly(x.remind_on) : ''), stay: true,
+        type: 'hold', id: x.id, remind_on: x.remind_on });
     });
     cal.blocks.forEach(function (x) {
       if (x.released_at) return;
       var rg = parseRange(x.period) || { start: x.start_date, end: x.end_date };
-      out.push({ kind: 'Blocked', cls: 'p-block', label: x.reason || 'Blocked', start: rg.start, end: rg.end, sub: 'blocked dates', stay: false });
+      out.push({ kind: 'Blocked', cls: 'p-block', label: x.reason || 'Blocked', start: rg.start, end: rg.end, sub: 'blocked dates', stay: false, type: 'block', id: x.id });
     });
     return out.filter(function (i) { return i.start && i.end; });
   }
@@ -658,9 +661,13 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
       db.from('reservations').select('*').order('check_in', { ascending: true }).limit(1000),
       db.from('availability_holds').select('*').order('check_in', { ascending: true }).limit(1000),
       db.from('blocked_dates').select('*').order('start_date', { ascending: true }).limit(1000),
-      db.from('guests').select('id, full_name').limit(2000)
+      db.from('guests').select('id, full_name').limit(2000),
+      db.from('properties').select('*')
     ]).then(function (res) {
       var errs = [];
+      if (res[4].error) errs.push('properties: ' + res[4].error.message);
+      cal.props = res[4].data || [];
+      if (!cal.propId || !cal.props.some(function (p) { return p.id === cal.propId; })) cal.propId = cal.props.length ? cal.props[0].id : null;
       ['reservations', 'holds', 'blocked dates'].forEach(function (n, i) { if (res[i].error) errs.push(n + ': ' + res[i].error.message); });
       cal.err = errs.length ? errs.join(' | ') : null;
       cal.res = res[0].data || []; cal.holds = res[1].data || []; cal.blocks = res[2].data || [];
@@ -676,6 +683,126 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
     cal.m += delta;
     if (cal.m < 0) { cal.m = 11; cal.y--; } else if (cal.m > 11) { cal.m = 0; cal.y++; }
     cal.sel = null; renderCal();
+  }
+
+
+  // ---- add / release (all through database functions; the database checks the owner) ----
+  function propName(p) { return p.name || p.title || p.slug || 'Property'; }
+  function fld(label, input) { return h('div', { class: 'field' }, [h('label', { text: label }), input]); }
+  function dIn(key, type, ph) {
+    var el = h('input', { type: type, placeholder: ph || '' });
+    el.value = cal.draft[key] || '';
+    el.addEventListener('input', function () { cal.draft[key] = el.value; });
+    return el;
+  }
+  function setMsgCal(t, good) { cal.msg = t ? { t: t, good: !!good } : null; }
+  function openForm(kind) { cal.form = cal.form === kind ? null : kind; cal.draft = {}; setMsgCal(null); renderCal(); }
+  function describeItems(items, sep) {
+    return items.map(function (it) {
+      var kind = it.kind === 'reservation' ? 'Reservation' : it.kind === 'hold' ? 'Hold' : 'Blocked';
+      return kind + ' ' + (it.label || '') + ', ' + it.check_in + ' to ' + it.check_out + ' [' + it.status + ']';
+    }).join(sep);
+  }
+  function calFail(t) { cal.busy = false; setMsgCal(t, false); renderCal(); }
+
+  function submitForm() {
+    if (cal.busy) return;
+    var d = cal.draft, isHold = cal.form === 'hold';
+    if (!cal.propId) return calFail('No property was found, so nothing was saved.');
+    if (isHold && !(d.label || '').trim()) return calFail('Please say who the hold is for.');
+    if (!isHold && !(d.reason || '').trim()) return calFail('Please give a reason for blocking.');
+    if (!d.a || !d.b) return calFail('Please pick both dates.');
+    var from = d.a, to = isHold ? d.b : addDays(d.b, 1);
+    if (to <= from) return calFail(isHold ? 'Check-out must be after check-in.' : 'The last night must be on or after the first night.');
+    cal.busy = true; setMsgCal('Checking the dates...', true); renderCal();
+    db.rpc('check_availability', { p_property_id: cal.propId, p_check_in: from, p_check_out: to, p_exclude_reservation: null, p_exclude_inquiry: null })
+      .then(function (res) {
+        if (res.error) return calFail('Could not check the dates, so nothing was saved. ' + res.error.message);
+        var items = res.data || [];
+        var conflicts = items.filter(function (it) { return it.severity === 'conflict'; });
+        if (conflicts.length) return calFail('These dates are not free, so nothing was saved: ' + describeItems(conflicts, '; '));
+        if (items.length && !confirm('Heads up. These dates overlap with:\n\n' + describeItems(items, '\n') + '\n\nSave anyway?')) {
+          cal.busy = false; setMsgCal('Nothing was saved.', true); return renderCal();
+        }
+        var call = isHold
+          ? db.rpc('create_hold', { p_property_id: cal.propId, p_label: d.label.trim(), p_check_in: from, p_check_out: to, p_reason: (d.reason || '').trim() || null, p_remind_on: d.remind || null })
+          : db.rpc('create_block', { p_property_id: cal.propId, p_start: from, p_end: to, p_reason: d.reason.trim() });
+        call.then(function (r2) {
+          if (r2.error) return calFail('Could not save. ' + r2.error.message);
+          cal.busy = false; cal.form = null; cal.draft = {};
+          setMsgCal(isHold ? 'Hold saved. The dates are now held, not booked.' : 'Dates blocked.', true);
+          cal.sel = from;
+          var t = from.split('-'); cal.y = +t[0]; cal.m = +t[1] - 1;
+          loadCal();
+        });
+      });
+  }
+
+  function afterChange(res, okText) {
+    if (res.error) return calFail('Could not do that. ' + res.error.message);
+    cal.busy = false; setMsgCal(okText, true); loadCal();
+  }
+  function doRelease(i) {
+    if (cal.busy) return;
+    var note = prompt('Release the hold for "' + i.label + '"? The dates become free again.\nAdd a short note (optional), then press OK.', '');
+    if (note === null) return;
+    cal.busy = true;
+    db.rpc('release_hold', { p_hold_id: i.id, p_note: note.trim() || null }).then(function (res) { afterChange(res, 'Hold released.'); });
+  }
+  function doExtend(i, val) {
+    if (cal.busy) return;
+    if (!val) return calFail('Please pick a new reminder date.');
+    cal.busy = true;
+    db.rpc('extend_hold', { p_hold_id: i.id, p_new_remind_on: val, p_note: null }).then(function (res) { afterChange(res, 'Reminder date changed. The hold is still active.'); });
+  }
+  function doUnblock(i) {
+    if (cal.busy) return;
+    if (!confirm('Unblock these dates (' + i.label + ')? They become free again.')) return;
+    cal.busy = true;
+    db.rpc('release_blocked_dates', { p_block_id: i.id }).then(function (res) { afterChange(res, 'Dates unblocked.'); });
+  }
+
+  function calFormEl() {
+    var isHold = cal.form === 'hold';
+    var kids = [h('h3', { text: isHold ? 'Hold dates' : 'Block dates' })];
+    if (cal.props.length > 1) {
+      var ps = h('select', null, cal.props.map(function (p) { var o = h('option', { value: p.id, text: propName(p) }); if (p.id === cal.propId) o.selected = true; return o; }));
+      ps.addEventListener('change', function () { cal.propId = ps.value; });
+      kids.push(fld('Property', ps));
+    }
+    if (isHold) {
+      kids.push(fld('Who is it for?', dIn('label', 'text', 'Guest name')), fld('Check-in', dIn('a', 'date')), fld('Check-out', dIn('b', 'date')),
+        fld('Reason (optional)', dIn('reason', 'text')), fld('Remind us on (optional)', dIn('remind', 'date')));
+    } else {
+      kids.push(fld('First blocked night', dIn('a', 'date')), fld('Last blocked night', dIn('b', 'date')),
+        fld('Reason', dIn('reason', 'text', 'e.g. owners staying, repairs')));
+    }
+    kids.push(h('div', { class: 'actions' }, [
+      h('button', { class: 'btn small', type: 'button', text: isHold ? 'Save hold' : 'Block dates', onclick: submitForm }),
+      h('button', { class: 'btn ghost small', type: 'button', text: 'Cancel', onclick: function () { cal.form = null; cal.draft = {}; setMsgCal(null); renderCal(); } })
+    ]));
+    kids.push(h('p', { class: 'small-print', text: isHold
+      ? 'A hold keeps the dates for someone for now. It is not a booking and nothing is sent to the guest. It never releases by itself: you release it.'
+      : 'Blocked nights cannot be booked. The check-out day after the last blocked night stays free.' }));
+    return h('div', { class: 'card', style: 'padding:1rem 1.1rem;' }, kids);
+  }
+
+  function itemActions(i) {
+    if (i.type === 'hold') {
+      var rd = h('input', { type: 'date', style: 'max-width:11rem;' });
+      if (i.remind_on) rd.value = i.remind_on;
+      return h('div', { class: 'actions', style: 'margin-top:.4rem;' }, [
+        h('button', { class: 'btn small', type: 'button', text: 'Release hold', onclick: function () { doRelease(i); } }),
+        rd,
+        h('button', { class: 'btn ghost small', type: 'button', text: 'Change reminder date', onclick: function () { doExtend(i, rd.value); } })
+      ]);
+    }
+    if (i.type === 'block') {
+      return h('div', { class: 'actions', style: 'margin-top:.4rem;' }, [
+        h('button', { class: 'btn small', type: 'button', text: 'Unblock', onclick: function () { doUnblock(i); } })
+      ]);
+    }
+    return null;
   }
 
   function renderCal() {
@@ -710,6 +837,12 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
       h('span', { class: 'pill p-hold', text: 'Hold' }), h('span', { class: 'pill p-block', text: 'Blocked' }), h('span', { class: 'pill p-done', text: 'Finished' })
     ]);
     var kids = [head];
+    if (cal.msg) kids.push(h('p', { class: cal.msg.good ? 'ok' : 'err', text: cal.msg.t }));
+    kids.push(h('div', { class: 'actions', style: 'margin-bottom:.75rem;' }, [
+      h('button', { class: 'btn small', type: 'button', text: 'Hold dates', onclick: function () { openForm('hold'); } }),
+      h('button', { class: 'btn ghost small', type: 'button', text: 'Block dates', onclick: function () { openForm('block'); } })
+    ]));
+    if (cal.form) kids.push(calFormEl());
     if (cal.err) kids.push(h('p', { class: 'err', text: 'Some data could not be loaded. ' + cal.err }));
     kids.push(grid, legend);
     if (cal.sel) {
@@ -721,12 +854,12 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
         var span = i.stay ? 'Check-in ' + dateOnly(i.start) + ', check-out ' + dateOnly(i.end) : 'Blocked ' + dateOnly(i.start) + ' to ' + dateOnly(addDays(i.end, -1));
         panel.appendChild(h('div', { class: 'day-item' }, [
           h('span', { class: 'pill ' + i.cls, text: i.kind }),
-          h('div', null, [h('strong', { text: i.label }), h('div', { class: 'small-print', text: span }), h('div', { class: 'small-print', text: i.sub })])
+          h('div', null, [h('strong', { text: i.label }), h('div', { class: 'small-print', text: span }), h('div', { class: 'small-print', text: i.sub }), itemActions(i)])
         ]));
       });
       kids.push(panel);
     }
-    kids.push(h('p', { class: 'small-print', text: 'View only. A booked night is the night you stay: the check-out day stays free for the next guest. Nothing here changes bookings.' }));
+    kids.push(h('p', { class: 'small-print', text: 'A booked night is the night you stay: the check-out day stays free for the next guest. Reservations here are view only. Holds and blocks are changed only when you press a button, and nothing is sent to guests.' }));
     box.replaceChildren.apply(box, kids);
   }
 
