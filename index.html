@@ -80,6 +80,13 @@
   .hist li { padding:.3rem 0; border-bottom:1px solid var(--line); }
   .empty { text-align:center; color:var(--ink-soft); padding:2.5rem 1rem; }
   .small-print { font-size:.78rem; color:var(--ink-soft); margin:.4rem 0 0; }
+  /* chats */
+  .dot { display:inline-block; min-width:1.1rem; padding:0 .35rem; border-radius:999px; background:var(--red); color:#fff; font-size:.7rem; font-weight:700; margin-left:.4rem; text-align:center; }
+  .thread { max-height:340px; overflow-y:auto; background:var(--cream); border:1px solid var(--line); border-radius:12px; padding:.75rem; display:flex; flex-direction:column; gap:.5rem; }
+  .bubble { max-width:85%; padding:.5rem .75rem; border-radius:14px; font-size:.92rem; white-space:pre-wrap; word-break:break-word; }
+  .bubble.guest { align-self:flex-start; background:var(--white); border:1px solid var(--line); }
+  .bubble.owner { align-self:flex-end; background:var(--navy); color:var(--cream); }
+  .bubble .who { display:block; font-size:.7rem; opacity:.7; margin-bottom:.1rem; }
 </style>
 </head>
 <body>
@@ -97,16 +104,20 @@
 
 <section id="app" class="hidden">
   <header class="top">
-    <h2>Inquiry inbox</h2>
+    <h2 id="pageTitle">Inquiry inbox</h2>
     <div class="who"><span id="whoami"></span><button class="btn ghost small" id="refreshBtn" type="button">Refresh</button><button class="btn ghost small" id="logoutBtn" type="button">Sign out</button></div>
   </header>
   <main>
-    <div class="toolbar">
-      <div class="tabs" id="tabs"></div>
-      <input id="search" type="search" placeholder="Search name, phone, ref">
+    <div class="tabs" id="views" style="margin-bottom:1rem"></div>
+    <div id="inqView">
+      <div class="toolbar">
+        <div class="tabs" id="tabs"></div>
+        <input id="search" type="search" placeholder="Search name, phone, ref">
+      </div>
+      <p class="note-bar" id="noteBar"></p>
+      <div id="list"></div>
     </div>
-    <p class="note-bar" id="noteBar"></p>
-    <div id="list"></div>
+    <div id="chatView" class="hidden"></div>
   </main>
 </section>
 
@@ -126,7 +137,7 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
   var OPEN_SET = ['new', 'checking_availability', 'replied'];
   var PICKABLE = ['new', 'checking_availability', 'replied', 'rejected', 'closed']; // 'converted' is set by the conversion flow later
 
-  var state = { me: null, rows: [], names: {}, tab: 'open', q: '', openId: null };
+  var state = { me: null, rows: [], names: {}, tab: 'open', q: '', openId: null, view: 'inq' };
 
   function $(id) { return document.getElementById(id); }
   function h(tag, props, kids) {
@@ -163,7 +174,7 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
   $('logoutBtn').addEventListener('click', function () {
     db.auth.signOut().then(function () { location.reload(); });
   });
-  $('refreshBtn').addEventListener('click', function () { load(); });
+  $('refreshBtn').addEventListener('click', function () { load(); loadChats(); });
 
   function start() {
     db.auth.getUser().then(function (r) {
@@ -184,6 +195,9 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
         $('login').classList.add('hidden');
         $('app').classList.remove('hidden');
         load();
+        setView('inq');
+        loadChats();
+        startRealtime();
       });
     });
   }
@@ -373,6 +387,204 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
         }));
       });
   }
+
+  // ---------------------------------------------------------------- chats ----
+  var chat = { rows: [], tab: 'open', openId: null, msgs: {}, err: null, channel: null, timer: null };
+
+  function isUnread(c) {
+    return !!c.last_guest_message_at && (!c.owner_last_read_at || Date.parse(c.owner_last_read_at) < Date.parse(c.last_guest_message_at));
+  }
+  function unreadCount() { return chat.rows.filter(isUnread).length; }
+
+  function renderViews() {
+    var n = unreadCount();
+    var defs = [['inq', 'Inquiries', 0], ['chats', 'Chats', n]];
+    $('views').replaceChildren.apply($('views'), defs.map(function (t) {
+      var kids = [t[1]];
+      if (t[2]) kids.push(h('span', { class: 'dot', text: String(t[2]) }));
+      return h('button', { class: 'tab' + (state.view === t[0] ? ' active' : ''), type: 'button', onclick: function () { setView(t[0]); } }, kids);
+    }));
+    document.title = (n ? '(' + n + ') ' : '') + 'Inbox | Nap & Yap';
+  }
+  function setView(v) {
+    state.view = v;
+    $('inqView').classList.toggle('hidden', v !== 'inq');
+    $('chatView').classList.toggle('hidden', v !== 'chats');
+    $('pageTitle').textContent = v === 'chats' ? 'Guest chats' : 'Inquiry inbox';
+    renderViews();
+    if (v === 'chats') { renderChats(); if (chat.openId) loadMessages(chat.openId); }
+  }
+  function readDraft() {
+    var ta = chat.openId ? document.getElementById('reply-' + chat.openId) : null;
+    return ta ? { id: chat.openId, value: ta.value } : null;
+  }
+  // do not rebuild the screen while an owner is typing a reply
+  function refreshChats() {
+    var a = document.activeElement;
+    if (a && a.id && a.id.indexOf('reply-') === 0) return;
+    renderChats(readDraft());
+  }
+  function patchChat(updated) {
+    for (var i = 0; i < chat.rows.length; i++) if (chat.rows[i].id === updated.id) chat.rows[i] = updated;
+  }
+
+  function loadChats() {
+    Promise.all([
+      db.from('chat_conversations').select('*').order('last_message_at', { ascending: false }).limit(200),
+      db.from('profiles').select('id, full_name')
+    ]).then(function (res) {
+      if (res[0].error) { chat.err = res[0].error.message; if (state.view === 'chats') refreshChats(); return; }
+      chat.err = null;
+      chat.rows = res[0].data || [];
+      (res[1].data || []).forEach(function (p) { state.names[p.id] = p.full_name || 'Owner'; });
+      renderViews();
+      if (state.view === 'chats') { refreshChats(); if (chat.openId) loadMessages(chat.openId); }
+    });
+  }
+
+  function renderChats(keep) {
+    var box = $('chatView');
+    var open = chat.rows.filter(function (c) { return c.status === 'open'; }).length;
+    var tabs = [['open', 'Open', open], ['closed', 'Closed', chat.rows.length - open], ['all', 'All', chat.rows.length]];
+    var tabBar = h('div', { class: 'toolbar' }, [h('div', { class: 'tabs' }, tabs.map(function (t) {
+      return h('button', { class: 'tab' + (chat.tab === t[0] ? ' active' : ''), type: 'button', onclick: function () { chat.tab = t[0]; renderChats(readDraft()); } },
+        [t[1], h('span', { class: 'n', text: String(t[2]) })]);
+    }))]);
+    var rows = chat.rows.filter(function (c) { return chat.tab === 'all' || c.status === chat.tab; });
+    var kids = [tabBar];
+    if (chat.err) kids.push(h('p', { class: 'err', text: 'Could not load chats: ' + chat.err }));
+    else if (!rows.length) kids.push(h('div', { class: 'empty', text: chat.rows.length ? 'Nothing here.' : 'No chats yet.' }));
+    else rows.forEach(function (c) { kids.push(chatCard(c, keep)); });
+    box.replaceChildren.apply(box, kids);
+    if (chat.openId) paintMessages(chat.openId);
+  }
+
+  function chatCard(c, keep) {
+    var isOpen = chat.openId === c.id;
+    var unread = isUnread(c);
+    var row = h('button', { class: 'row', type: 'button', onclick: function () {
+      chat.openId = isOpen ? null : c.id;
+      renderChats();
+      if (chat.openId) loadMessages(chat.openId);
+    } }, [
+      h('span', { class: 'name', text: c.guest_name }),
+      h('span', { class: 'ref', text: 'Last message ' + fmtStamp.format(new Date(c.last_message_at)) }),
+      h('span', { class: 'meta', text: c.phone || c.email || '' }),
+      h('span', { class: 'badge' + (unread ? ' new' : ''), text: unread ? 'New message' : (c.status === 'open' ? 'Open' : 'Closed') })
+    ]);
+    var el = h('div', { class: 'card' + (isOpen ? ' open' : '') }, [row]);
+    if (isOpen) el.appendChild(chatDetail(c, keep));
+    return el;
+  }
+
+  function chatDetail(c, keep) {
+    var phone = c.phone && /^[0-9+()\-\s]{7,50}$/.test(c.phone) ? h('a', { href: 'tel:' + c.phone.replace(/[^0-9+]/g, ''), text: c.phone }) : plain(c.phone);
+    var email = c.email && /^[^\s@?&#]+@[^\s@?&#]+\.[^\s@?&#]+$/.test(c.email) ? h('a', { href: 'mailto:' + c.email, text: c.email }) : plain(c.email);
+    var thread = h('div', { class: 'thread', id: 'msgs-' + c.id });
+    var ta = h('textarea', { id: 'reply-' + c.id, rows: '3', maxlength: '2000', placeholder: 'Type your reply to the guest' });
+    if (keep && keep.id === c.id) ta.value = keep.value;
+    var msg = h('p', { class: 'hidden' });
+    var sendBtn = h('button', { class: 'btn small', type: 'button', text: 'Send reply' });
+    sendBtn.addEventListener('click', function () { sendReply(c, ta, msg, sendBtn); });
+    var isOpenChat = c.status === 'open';
+    return h('div', { class: 'detail' }, [
+      h('div', { class: 'grid2' }, [
+        kv('Phone', phone), kv('Email', email),
+        kv('Chat started', plain(fmtStamp.format(new Date(c.created_at)))), kv('Status', plain(isOpenChat ? 'Open' : 'Closed'))
+      ]),
+      h('div', { class: 'section' }, [h('h3', { text: 'Messages' }), thread]),
+      h('div', { class: 'section' }, [
+        ta,
+        h('div', { class: 'actions', style: 'margin-top:.5rem' }, [
+          sendBtn,
+          h('button', { class: 'btn ghost small', type: 'button', text: isOpenChat ? 'Close chat' : 'Reopen chat', onclick: function () { setChatStatus(c, isOpenChat ? 'closed' : 'open'); } })
+        ]),
+        msg,
+        h('p', { class: 'small-print', text: 'Guests see your reply in the chat window on the website. They get no email or text. A chat is not a booking.' })
+      ])
+    ]);
+  }
+
+  function paintMessages(id) {
+    var box = document.getElementById('msgs-' + id);
+    if (!box) return;
+    var list = chat.msgs[id];
+    if (!list) { box.replaceChildren(h('p', { class: 'small-print', text: 'Loading...' })); return; }
+    if (!list.length) { box.replaceChildren(h('p', { class: 'small-print', text: 'No messages.' })); return; }
+    box.replaceChildren.apply(box, list.map(function (m) {
+      var who = m.sender === 'guest' ? 'Guest' : (state.names[m.sender_profile_id] || 'Owner');
+      return h('div', { class: 'bubble ' + (m.sender === 'guest' ? 'guest' : 'owner') }, [
+        h('span', { class: 'who', text: who + ' · ' + fmtStamp.format(new Date(m.created_at)) }),
+        document.createTextNode(m.body)
+      ]);
+    }));
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function loadMessages(id) {
+    db.from('chat_messages').select('id, sender, sender_profile_id, body, created_at').eq('conversation_id', id).order('created_at', { ascending: true }).limit(500)
+      .then(function (res) {
+        if (res.error) {
+          var b = document.getElementById('msgs-' + id);
+          if (b) b.replaceChildren(h('p', { class: 'err', text: 'Could not load messages: ' + res.error.message }));
+          return;
+        }
+        chat.msgs[id] = res.data || [];
+        paintMessages(id);
+        var c = chat.rows.filter(function (x) { return x.id === id; })[0];
+        if (c && isUnread(c) && state.view === 'chats' && chat.openId === id && !document.hidden) markRead(c);
+      });
+  }
+
+  // read time is set to the guest message's own server time, so clocks cannot disagree
+  function markRead(c) {
+    db.from('chat_conversations').update({ owner_last_read_at: c.last_guest_message_at }).eq('id', c.id).select().single().then(function (res) {
+      if (res.error || !res.data) return;
+      patchChat(res.data);
+      renderViews();
+      if (state.view === 'chats') refreshChats();
+    });
+  }
+
+  function sendReply(c, ta, msg, btn) {
+    var body = ta.value.trim();
+    if (!body) return setMsg(msg, 'Type a message first.', false);
+    if (body.length > 2000) return setMsg(msg, 'Please keep it under 2000 characters.', false);
+    btn.disabled = true;
+    db.from('chat_messages').insert({ conversation_id: c.id, sender: 'owner', sender_profile_id: state.me.id, body: body })
+      .select('id, sender, sender_profile_id, body, created_at').single().then(function (res) {
+        btn.disabled = false;
+        if (res.error || !res.data) return setMsg(msg, 'Not sent. ' + (res.error ? res.error.message : 'Not allowed.'), false);
+        ta.value = '';
+        setMsg(msg, 'Sent.', true);
+        (chat.msgs[c.id] = chat.msgs[c.id] || []).push(res.data);
+        paintMessages(c.id);
+        loadChats();
+      });
+  }
+
+  function setChatStatus(c, s) {
+    if (s === 'closed' && !confirm('Close this chat? If the guest writes again it reopens.')) return;
+    db.from('chat_conversations').update({ status: s }).eq('id', c.id).select().single().then(function (res) {
+      if (res.error || !res.data) { alert('Could not change the chat. ' + (res.error ? res.error.message : 'Not allowed.')); return; }
+      patchChat(res.data);
+      renderViews();
+      renderChats(readDraft());
+    });
+  }
+
+  function onChatEvent() { clearTimeout(chat.timer); chat.timer = setTimeout(loadChats, 400); }
+  function startRealtime() {
+    if (chat.channel) return;
+    try {
+      chat.channel = db.channel('owner-chats')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'chat_messages' }, onChatEvent)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'chat_conversations' }, onChatEvent)
+        .subscribe();
+    } catch (e) { /* the 20 second refresh below still works */ }
+  }
+  // fallback refresh in case realtime is not connected
+  setInterval(function () { if (!document.hidden && state.me) loadChats(); }, 20000);
 
   $('search').addEventListener('input', function (e) { state.q = e.target.value.trim().toLowerCase(); render(readOpenNotes()); });
 
