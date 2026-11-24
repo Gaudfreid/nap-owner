@@ -159,7 +159,7 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
   var OPEN_SET = ['new', 'checking_availability', 'replied'];
   var PICKABLE = ['new', 'checking_availability', 'replied', 'rejected', 'closed']; // 'converted' is set by the conversion flow later
 
-  var state = { me: null, rows: [], names: {}, tab: 'open', q: '', openId: null, view: 'inq' };
+  var state = { me: null, rows: [], names: {}, tab: 'open', q: '', openId: null, view: 'inq', convMsg: null };
 
   function $(id) { return document.getElementById(id); }
   function h(tag, props, kids) {
@@ -282,7 +282,7 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
     var meta = dateOnly(r.requested_check_in) + ' to ' + dateOnly(r.requested_check_out) +
       ' · ' + nights(r.requested_check_in, r.requested_check_out) + ' night(s) · ' + r.guest_count + ' guest(s)';
     var row = h('button', { class: 'row', type: 'button', onclick: function () {
-      state.openId = isOpen ? null : r.id; render();
+      state.openId = isOpen ? null : r.id; state.convMsg = null; render();
     } }, [
       h('span', { class: 'name', text: r.guest_name }),
       h('span', { class: 'ref', text: r.reference + ' · ' + fmtStamp.format(new Date(r.received_at)) }),
@@ -318,6 +318,19 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
       availBox,
       h('p', { class: 'small-print', text: 'This only checks the calendar. It does not hold or reserve the dates.' })
     ]));
+
+    // reservation (draft only; never confirms, never sends anything)
+    var convKids = [h('h3', { text: 'Reservation' })];
+    if (r.status === 'converted') {
+      convKids.push(h('p', { class: 'small-print', text: 'This inquiry already has a reservation. You can see it on the Calendar tab.' }));
+    } else if (OPEN_SET.indexOf(r.status) >= 0) {
+      var convBtn = h('button', { class: 'btn small', type: 'button', text: 'Create reservation (draft)' });
+      convBtn.addEventListener('click', function () { convertInquiry(r, convBtn); });
+      convKids.push(convBtn);
+      convKids.push(h('p', { class: 'small-print', text: 'This makes a quotation draft, not a confirmed booking. It does not hold the dates, and nothing is sent to the guest. Confirming is a separate step.' }));
+    }
+    if (state.convMsg && state.convMsg.id === r.id) convKids.push(h('p', { class: state.convMsg.good ? 'ok' : 'err', text: state.convMsg.t }));
+    if (convKids.length > 1) d.appendChild(h('div', { class: 'section' }, convKids));
 
     // status
     var sel = h('select', { id: 'status-' + r.id }, PICKABLE.map(function (s) {
@@ -356,6 +369,26 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
   }
 
   function setMsg(el, text, good) { el.className = good ? 'ok' : 'err'; el.textContent = text; }
+
+  function convertInquiry(r, btn) {
+    var msg = 'Create a reservation draft for ' + r.guest_name + '?\n\n' +
+      dateOnly(r.requested_check_in) + ' to ' + dateOnly(r.requested_check_out) + ', ' + r.guest_count + ' guest(s).\n\n' +
+      'It starts as a quotation draft. It is NOT a confirmed booking, it does not hold the dates, and nothing is sent to the guest.';
+    if (!confirm(msg)) return;
+    btn.disabled = true;
+    db.rpc('create_reservation_from_inquiry', { p_inquiry_id: r.id }).then(function (res) {
+      if (res.error) {
+        state.convMsg = { id: r.id, t: 'Could not create the reservation. ' + res.error.message, good: false };
+        render(readOpenNotes());
+        return;
+      }
+      var ref = res.data && res.data.reference ? res.data.reference + ' ' : '';
+      state.convMsg = { id: r.id, t: 'Reservation draft ' + ref + 'created. It is a quotation draft, not a booking. Nothing was sent to the guest.', good: true };
+      cal.loaded = false;
+      state.tab = 'all'; // the inquiry leaves the Open list once converted; keep it visible so the message can be read
+      load();
+    });
+  }
 
   function patchRow(updated) {
     for (var i = 0; i < state.rows.length; i++) if (state.rows[i].id === updated.id) state.rows[i] = updated;
