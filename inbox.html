@@ -171,8 +171,11 @@ var SUPABASE_KEY = 'sb_publishable_Wo_arDwjqPxXICg5KntXqw_zyhwI10v';   // public
       var uid = r.data.user.id;
       db.from('profiles').select('id, full_name, role, is_active').eq('id', uid).single().then(function (p) {
         if (p.error || !p.data || p.data.role !== 'owner' || !p.data.is_active) {
+          var why = p.error ? ' (' + p.error.message + ')'
+            : !p.data ? ' (no profile found)'
+            : ' (role: ' + p.data.role + ', active: ' + p.data.is_active + ')';
           db.auth.signOut().then(function () {
-            showLogin('This login does not have access to the inbox.');
+            showLogin('This login does not have access to the inbox.' + why);
           });
           return;
         }
