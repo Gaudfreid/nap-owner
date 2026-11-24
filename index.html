@@ -87,6 +87,27 @@
   .bubble.guest { align-self:flex-start; background:var(--white); border:1px solid var(--line); }
   .bubble.owner { align-self:flex-end; background:var(--navy); color:var(--cream); }
   .bubble .who { display:block; font-size:.7rem; opacity:.7; margin-bottom:.1rem; }
+  /* calendar */
+  .cal-head { display:flex; align-items:center; gap:.5rem; margin-bottom:.75rem; flex-wrap:wrap; }
+  .cal-head h3 { flex:1; min-width:140px; text-align:center; }
+  .cal-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:4px; }
+  .cal-dow { font-size:.7rem; text-transform:uppercase; color:var(--ink-soft); font-weight:600; text-align:center; padding:.2rem 0; }
+  .cal-cell { min-height:84px; background:var(--white); border:1px solid var(--line); border-radius:8px; padding:.25rem; cursor:pointer; overflow:hidden; display:flex; flex-direction:column; gap:2px; text-align:left; font:inherit; color:inherit; }
+  .cal-cell.blank { background:transparent; border-color:transparent; cursor:default; }
+  .cal-cell.today { border-color:var(--gold); box-shadow:inset 0 0 0 1px var(--gold); }
+  .cal-cell.sel { background:#FFFDF9; border-color:var(--navy); }
+  .cal-cell .dn { font-size:.72rem; color:var(--ink-soft); font-weight:600; }
+  .pill { font-size:.68rem; line-height:1.25; padding:1px 4px; border-radius:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:block; }
+  .p-conf { background:var(--navy); color:var(--cream); }
+  .p-pend { background:#F3E3BE; color:#6B4E0E; border:1px solid var(--gold); }
+  .p-done { background:var(--cream-dark); color:var(--ink-soft); }
+  .p-hold { background:#F2D9CE; color:#7A3A1F; border:1px dashed var(--terracotta); }
+  .p-block { background:repeating-linear-gradient(45deg,#E4E0D6,#E4E0D6 4px,#F1EEE6 4px,#F1EEE6 8px); color:var(--ink-soft); }
+  .cal-more { font-size:.66rem; color:var(--ink-soft); }
+  .legend { display:flex; gap:.5rem; flex-wrap:wrap; margin:.75rem 0; font-size:.75rem; }
+  .legend .pill { display:inline-block; padding:2px 8px; }
+  .day-item { display:grid; grid-template-columns:auto 1fr; gap:.25rem .75rem; align-items:start; padding:.5rem 0; border-bottom:1px solid var(--line); font-size:.9rem; }
+  @media (max-width:600px) { .cal-cell { min-height:64px; } .cal-cell .pill { font-size:0; height:6px; padding:0; } }
 </style>
 </head>
 <body>
@@ -118,6 +139,7 @@
       <div id="list"></div>
     </div>
     <div id="chatView" class="hidden"></div>
+    <div id="calView" class="hidden"></div>
   </main>
 </section>
 
@@ -174,7 +196,7 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
   $('logoutBtn').addEventListener('click', function () {
     db.auth.signOut().then(function () { location.reload(); });
   });
-  $('refreshBtn').addEventListener('click', function () { load(); loadChats(); });
+  $('refreshBtn').addEventListener('click', function () { load(); loadChats(); if (state.view === 'cal') loadCal(); });
 
   function start() {
     db.auth.getUser().then(function (r) {
@@ -398,7 +420,7 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
 
   function renderViews() {
     var n = unreadCount();
-    var defs = [['inq', 'Inquiries', 0], ['chats', 'Chats', n]];
+    var defs = [['inq', 'Inquiries', 0], ['chats', 'Chats', n], ['cal', 'Calendar', 0]];
     $('views').replaceChildren.apply($('views'), defs.map(function (t) {
       var kids = [t[1]];
       if (t[2]) kids.push(h('span', { class: 'dot', text: String(t[2]) }));
@@ -410,9 +432,11 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
     state.view = v;
     $('inqView').classList.toggle('hidden', v !== 'inq');
     $('chatView').classList.toggle('hidden', v !== 'chats');
-    $('pageTitle').textContent = v === 'chats' ? 'Guest chats' : 'Inquiry inbox';
+    $('calView').classList.toggle('hidden', v !== 'cal');
+    $('pageTitle').textContent = v === 'chats' ? 'Guest chats' : v === 'cal' ? 'Calendar' : 'Inquiry inbox';
     renderViews();
     if (v === 'chats') { renderChats(); if (chat.openId) loadMessages(chat.openId); }
+    if (v === 'cal') { if (cal.loaded) renderCal(); else loadCal(); }
   }
   function readDraft() {
     var ta = chat.openId ? document.getElementById('reply-' + chat.openId) : null;
@@ -585,6 +609,126 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
   }
   // fallback refresh in case realtime is not connected
   setInterval(function () { if (!document.hidden && state.me) loadChats(); }, 20000);
+
+  // ------------------------------------------------------------- calendar ----
+  // View only. Shows reservations, active holds and blocked dates. It never changes anything.
+  var cal = { y: null, m: null, res: [], holds: [], blocks: [], names: {}, err: null, loaded: false, sel: null };
+
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+  function manilaToday() { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date()); }
+  function addDays(s, n) { var d = new Date(s + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+  // Postgres daterange text, e.g. [2026-12-01,2026-12-05). Returns {start, end} with end NOT included.
+  function parseRange(raw) {
+    var m = /^([\[(])([^,]*),([^\])]*)([\])])$/.exec(String(raw || '').replace(/"/g, ''));
+    if (!m || !m[2] || !m[3]) return null;
+    var lo = m[2], hi = m[3];
+    if (m[1] === '(') lo = addDays(lo, 1);
+    if (m[4] === ']') hi = addDays(hi, 1);
+    return { start: lo, end: hi };
+  }
+  function pretty(s) { return String(s || '').replace(/_/g, ' '); }
+
+  function calItems() {
+    var out = [];
+    cal.res.forEach(function (r) {
+      if (['cancelled', 'rejected', 'rebooked'].indexOf(r.status) >= 0) return;
+      var rg = parseRange(r.stay) || { start: r.check_in, end: r.check_out };
+      var cls = ['confirmed', 'checked_in', 'in_stay'].indexOf(r.status) >= 0 ? 'p-conf'
+        : ['checked_out', 'completed'].indexOf(r.status) >= 0 ? 'p-done' : 'p-pend';
+      out.push({ kind: 'Reservation', cls: cls, label: cal.names[r.guest_id] || r.reference || 'Reservation', start: rg.start, end: rg.end,
+        sub: pretty(r.status) + (r.reference ? ' · ' + r.reference : '') + (r.guest_count ? ' · ' + r.guest_count + ' guest(s)' : ''), stay: true });
+    });
+    cal.holds.forEach(function (x) {
+      if (x.status !== 'active') return;
+      var rg = parseRange(x.period) || { start: x.check_in, end: x.check_out };
+      out.push({ kind: 'Hold', cls: 'p-hold', label: x.label || 'Hold', start: rg.start, end: rg.end,
+        sub: 'active hold' + (x.reason ? ' · ' + x.reason : '') + (x.remind_on ? ' · remind ' + dateOnly(x.remind_on) : ''), stay: true });
+    });
+    cal.blocks.forEach(function (x) {
+      if (x.released_at) return;
+      var rg = parseRange(x.period) || { start: x.start_date, end: x.end_date };
+      out.push({ kind: 'Blocked', cls: 'p-block', label: x.reason || 'Blocked', start: rg.start, end: rg.end, sub: 'blocked dates', stay: false });
+    });
+    return out.filter(function (i) { return i.start && i.end; });
+  }
+
+  function loadCal() {
+    $('calView').replaceChildren(h('p', { class: 'small-print', text: 'Loading calendar...' }));
+    Promise.all([
+      db.from('reservations').select('*').order('check_in', { ascending: true }).limit(1000),
+      db.from('availability_holds').select('*').order('check_in', { ascending: true }).limit(1000),
+      db.from('blocked_dates').select('*').order('start_date', { ascending: true }).limit(1000),
+      db.from('guests').select('id, full_name').limit(2000)
+    ]).then(function (res) {
+      var errs = [];
+      ['reservations', 'holds', 'blocked dates'].forEach(function (n, i) { if (res[i].error) errs.push(n + ': ' + res[i].error.message); });
+      cal.err = errs.length ? errs.join(' | ') : null;
+      cal.res = res[0].data || []; cal.holds = res[1].data || []; cal.blocks = res[2].data || [];
+      cal.names = {};
+      (res[3].data || []).forEach(function (g) { cal.names[g.id] = g.full_name; });
+      if (cal.y === null) { var t = manilaToday().split('-'); cal.y = +t[0]; cal.m = +t[1] - 1; }
+      cal.loaded = true;
+      if (state.view === 'cal') renderCal();
+    });
+  }
+
+  function shiftMonth(delta) {
+    cal.m += delta;
+    if (cal.m < 0) { cal.m = 11; cal.y--; } else if (cal.m > 11) { cal.m = 0; cal.y++; }
+    cal.sel = null; renderCal();
+  }
+
+  function renderCal() {
+    var box = $('calView');
+    var items = calItems();
+    var today = manilaToday();
+    var monthName = new Date(Date.UTC(cal.y, cal.m, 1)).toLocaleString('en-PH', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+    var head = h('div', { class: 'cal-head' }, [
+      h('button', { class: 'btn ghost small', type: 'button', text: 'Previous', onclick: function () { shiftMonth(-1); } }),
+      h('h3', { text: monthName }),
+      h('button', { class: 'btn ghost small', type: 'button', text: 'Today', onclick: function () { var t = today.split('-'); cal.y = +t[0]; cal.m = +t[1] - 1; cal.sel = today; renderCal(); } }),
+      h('button', { class: 'btn ghost small', type: 'button', text: 'Next', onclick: function () { shiftMonth(1); } })
+    ]);
+    var grid = h('div', { class: 'cal-grid' });
+    ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].forEach(function (d) { grid.appendChild(h('div', { class: 'cal-dow', text: d })); });
+    var lead = new Date(Date.UTC(cal.y, cal.m, 1)).getUTCDay();
+    var days = new Date(Date.UTC(cal.y, cal.m + 1, 0)).getUTCDate();
+    for (var b = 0; b < lead; b++) grid.appendChild(h('div', { class: 'cal-cell blank' }));
+    for (var d = 1; d <= days; d++) {
+      (function (day) {
+        var ds = cal.y + '-' + pad2(cal.m + 1) + '-' + pad2(day);
+        var here = items.filter(function (i) { return i.start <= ds && ds < i.end; });
+        var cell = h('button', { class: 'cal-cell' + (ds === today ? ' today' : '') + (ds === cal.sel ? ' sel' : ''), type: 'button',
+          onclick: function () { cal.sel = ds; renderCal(); } }, [h('span', { class: 'dn', text: String(day) })]);
+        here.slice(0, 3).forEach(function (i) { cell.appendChild(h('span', { class: 'pill ' + i.cls, text: i.label })); });
+        if (here.length > 3) cell.appendChild(h('span', { class: 'cal-more', text: '+' + (here.length - 3) + ' more' }));
+        grid.appendChild(cell);
+      })(d);
+    }
+    var legend = h('div', { class: 'legend' }, [
+      h('span', { class: 'pill p-conf', text: 'Confirmed / staying' }), h('span', { class: 'pill p-pend', text: 'Pending' }),
+      h('span', { class: 'pill p-hold', text: 'Hold' }), h('span', { class: 'pill p-block', text: 'Blocked' }), h('span', { class: 'pill p-done', text: 'Finished' })
+    ]);
+    var kids = [head];
+    if (cal.err) kids.push(h('p', { class: 'err', text: 'Some data could not be loaded. ' + cal.err }));
+    kids.push(grid, legend);
+    if (cal.sel) {
+      var sel = cal.sel;
+      var list = items.filter(function (i) { return i.start <= sel && sel < i.end; });
+      var panel = h('div', { class: 'card', style: 'padding:1rem 1.1rem;' }, [h('h3', { text: dateOnly(sel) })]);
+      if (!list.length) panel.appendChild(h('p', { class: 'small-print', text: 'Nothing booked, held or blocked on this night.' }));
+      list.forEach(function (i) {
+        var span = i.stay ? 'Check-in ' + dateOnly(i.start) + ', check-out ' + dateOnly(i.end) : 'Blocked ' + dateOnly(i.start) + ' to ' + dateOnly(addDays(i.end, -1));
+        panel.appendChild(h('div', { class: 'day-item' }, [
+          h('span', { class: 'pill ' + i.cls, text: i.kind }),
+          h('div', null, [h('strong', { text: i.label }), h('div', { class: 'small-print', text: span }), h('div', { class: 'small-print', text: i.sub })])
+        ]));
+      });
+      kids.push(panel);
+    }
+    kids.push(h('p', { class: 'small-print', text: 'View only. A booked night is the night you stay: the check-out day stays free for the next guest. Nothing here changes bookings.' }));
+    box.replaceChildren.apply(box, kids);
+  }
 
   $('search').addEventListener('input', function (e) { state.q = e.target.value.trim().toLowerCase(); render(readOpenNotes()); });
 
