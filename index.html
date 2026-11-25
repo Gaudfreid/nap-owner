@@ -662,6 +662,9 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
     return { start: lo, end: hi };
   }
   function pretty(s) { return String(s || '').replace(/_/g, ' '); }
+  var fmtPeso = new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' });
+  function peso(c) { return c == null ? 'not set' : fmtPeso.format(Number(c) / 100); }
+  function toCentavos(s) { var n = Number(String(s).trim()); return String(s).trim() === '' || !isFinite(n) ? null : Math.round(n * 100); }
 
   function calItems() {
     var out = [];
@@ -671,7 +674,9 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
       var cls = ['confirmed', 'checked_in', 'in_stay'].indexOf(r.status) >= 0 ? 'p-conf'
         : ['checked_out', 'completed'].indexOf(r.status) >= 0 ? 'p-done' : 'p-pend';
       out.push({ kind: 'Reservation', cls: cls, label: cal.names[r.guest_id] || r.reference || 'Reservation', start: rg.start, end: rg.end,
-        sub: pretty(r.status) + (r.reference ? ' · ' + r.reference : '') + (r.guest_count ? ' · ' + r.guest_count + ' guest(s)' : ''), stay: true });
+        sub: pretty(r.status) + (r.reference ? ' · ' + r.reference : '') + (r.guest_count ? ' · ' + r.guest_count + ' guest(s)' : '')
+          + (r.total_centavos != null ? ' · total ' + peso(r.total_centavos) + ', downpayment ' + peso(r.downpayment_centavos) + (r.downpayment_due_on ? ' due ' + dateOnly(r.downpayment_due_on) : '') : ' · no amounts yet'),
+        stay: true, type: 'reservation', id: r.id, status: r.status, total: r.total_centavos, down: r.downpayment_centavos, due: r.downpayment_due_on });
     });
     cal.holds.forEach(function (x) {
       if (x.status !== 'active') return;
@@ -795,6 +800,27 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
     db.rpc('release_blocked_dates', { p_block_id: i.id }).then(function (res) { afterChange(res, 'Dates unblocked.'); });
   }
 
+  // ---- reservation steps (database function checks the owner and the allowed moves) ----
+  function doQuote(i, totalVal, downVal, dueVal) {
+    if (cal.busy) return;
+    var total = toCentavos(totalVal), down = toCentavos(downVal);
+    if (total === null || total <= 0) return calFail('Please type the total amount in pesos.');
+    if (down === null || down < 0) return calFail('Please type the downpayment amount in pesos (0 if none).');
+    if (down > total) return calFail('The downpayment cannot be more than the total.');
+    cal.busy = true;
+    db.rpc('set_reservation_quote', { p_reservation_id: i.id, p_total_centavos: total, p_downpayment_centavos: down, p_due_on: dueVal || null })
+      .then(function (res) { afterChange(res, 'Quotation amounts saved. Nothing was sent to the guest.'); });
+  }
+  function doStatus(i, newStatus, askText, okText, needAmounts) {
+    if (cal.busy) return;
+    if (needAmounts && (i.total == null || i.down == null)) return calFail('Save the quotation amounts first.');
+    var note = prompt(askText + '\nAdd a short note (optional), then press OK.', '');
+    if (note === null) return;
+    cal.busy = true;
+    db.rpc('set_reservation_status', { p_reservation_id: i.id, p_new_status: newStatus, p_note: note.trim() || null, p_allow_warnings: false })
+      .then(function (res) { afterChange(res, okText); });
+  }
+
   function calFormEl() {
     var isHold = cal.form === 'hold';
     var kids = [h('h3', { text: isHold ? 'Hold dates' : 'Block dates' })];
@@ -834,6 +860,35 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
       return h('div', { class: 'actions', style: 'margin-top:.4rem;' }, [
         h('button', { class: 'btn small', type: 'button', text: 'Unblock', onclick: function () { doUnblock(i); } })
       ]);
+    }
+    if (i.type === 'reservation') {
+      var st = i.status, kids = [];
+      var canQuote = st === 'quotation_prepared' || st === 'quotation_sent';
+      if (canQuote) {
+        var tot = h('input', { type: 'number', min: '0', step: '0.01', placeholder: 'Total (PHP)', style: 'max-width:9rem;' });
+        var dn = h('input', { type: 'number', min: '0', step: '0.01', placeholder: 'Downpayment (PHP)', style: 'max-width:10rem;' });
+        var due = h('input', { type: 'date', style: 'max-width:11rem;' });
+        if (i.total != null) tot.value = String(i.total / 100);
+        if (i.down != null) dn.value = String(i.down / 100);
+        if (i.due) due.value = i.due;
+        kids.push(h('div', { class: 'small-print', text: 'You type the amounts yourself. Total, downpayment, and the date the downpayment is due (optional).' }));
+        kids.push(h('div', { class: 'actions', style: 'margin-top:.3rem;' }, [tot, dn, due,
+          h('button', { class: 'btn ghost small', type: 'button', text: 'Save quotation amounts', onclick: function () { doQuote(i, tot.value, dn.value, due.value); } })]));
+      }
+      var acts = [];
+      if (st === 'quotation_prepared') acts.push(h('button', { class: 'btn small', type: 'button', text: 'Mark quotation as sent',
+        onclick: function () { doStatus(i, 'quotation_sent', 'Mark the quotation as sent? Only press this after you have actually sent it to the guest yourself.', 'Marked as sent. The app did not send anything.', true); } }));
+      if (st === 'quotation_sent') {
+        acts.push(h('button', { class: 'btn small', type: 'button', text: 'Guest agreed: wait for downpayment',
+          onclick: function () { doStatus(i, 'awaiting_downpayment', 'The guest agreed to the quotation and now owes the downpayment?', 'Now waiting for the downpayment. The dates are still not blocked.', true); } }));
+        acts.push(h('button', { class: 'btn ghost small', type: 'button', text: 'Back to draft',
+          onclick: function () { doStatus(i, 'quotation_prepared', 'Move this back to a draft?', 'Moved back to a draft.', false); } }));
+      }
+      if (['quotation_prepared', 'quotation_sent', 'awaiting_downpayment'].indexOf(st) >= 0) acts.push(h('button', { class: 'btn ghost small', type: 'button', text: 'Cancel reservation',
+        onclick: function () { if (confirm('Cancel this reservation? It disappears from the calendar.')) doStatus(i, 'cancelled', 'Cancelling this reservation.', 'Reservation cancelled.', false); } }));
+      if (acts.length) kids.push(h('div', { class: 'actions', style: 'margin-top:.4rem;' }, acts));
+      if (st === 'awaiting_downpayment') kids.push(h('div', { class: 'small-print', text: 'Payments and confirming a booking are not in the app yet.' }));
+      return kids.length ? h('div', null, kids) : null;
     }
     return null;
   }
@@ -892,7 +947,7 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
       });
       kids.push(panel);
     }
-    kids.push(h('p', { class: 'small-print', text: 'A booked night is the night you stay: the check-out day stays free for the next guest. Reservations here are view only. Holds and blocks are changed only when you press a button, and nothing is sent to guests.' }));
+    kids.push(h('p', { class: 'small-print', text: 'A booked night is the night you stay: the check-out day stays free for the next guest. Reservations move forward only when you press a button. Holds and blocks are changed only when you press a button, and nothing is sent to guests.' }));
     box.replaceChildren.apply(box, kids);
   }
 
