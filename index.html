@@ -323,6 +323,10 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
     var convKids = [h('h3', { text: 'Reservation' })];
     if (r.status === 'converted') {
       convKids.push(h('p', { class: 'small-print', text: 'This inquiry already has a reservation. You can see it on the Calendar tab.' }));
+      var reopenBtn = h('button', { class: 'btn small', type: 'button', text: 'Reopen inquiry' });
+      reopenBtn.addEventListener('click', function () { reopenInquiry(r, reopenBtn); });
+      convKids.push(reopenBtn);
+      convKids.push(h('p', { class: 'small-print', text: 'Only works if the reservation was cancelled first. It moves this inquiry back to Checking availability so you can make a new draft. Nothing is sent to the guest.' }));
     } else if (OPEN_SET.indexOf(r.status) >= 0) {
       var convBtn = h('button', { class: 'btn small', type: 'button', text: 'Create reservation (draft)' });
       convBtn.addEventListener('click', function () { convertInquiry(r, convBtn); });
@@ -386,6 +390,24 @@ var SUPABASE_KEY = 'sb_publishable__roWQSn4T5xc8Kq09lqB7w_MCXYac6b';
       state.convMsg = { id: r.id, t: 'Reservation draft ' + ref + 'created. It is a quotation draft, not a booking. Nothing was sent to the guest.', good: true };
       cal.loaded = false;
       state.tab = 'all'; // the inquiry leaves the Open list once converted; keep it visible so the message can be read
+      load();
+    });
+  }
+
+  function reopenInquiry(r, btn) {
+    if (!confirm('Reopen the inquiry for ' + r.guest_name + '?\n\nIt goes back to Checking availability. The cancelled reservation stays in the history. Nothing is sent to the guest.')) return;
+    var note = prompt('Optional note (why you are reopening it):', '');
+    if (note === null) return;
+    btn.disabled = true;
+    db.rpc('reopen_inquiry', { p_inquiry_id: r.id, p_note: note.trim() || null }).then(function (res) {
+      if (res.error) {
+        state.convMsg = { id: r.id, t: 'Could not reopen. ' + res.error.message, good: false };
+        render(readOpenNotes());
+        return;
+      }
+      state.convMsg = { id: r.id, t: 'Inquiry reopened. Nothing was sent to the guest.', good: true };
+      cal.loaded = false;
+      state.tab = 'all';
       load();
     });
   }
